@@ -1,0 +1,29 @@
+# Dashboard AGI System - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core Audio Processing
+sounddevice==0.4.6
+scipy==1.11.4
+SpeechRecognition==3.10.1
+gTTS==2.5.1
+
+# AI/ML & Computer Vision
+openai==1.12.0
+ultralytics==8.1.24
+opencv-python==4.9.0.80
+numpy==1.26.4
+
+# OBD-II Interface (uncomment when ready to use)
+# obd==0.7.1
+# pyserial==3.5
+
+# Networking & Geolocation
+requests==2.31.0
+geopy==2.4.1
+
+# Utilities
+python-dotenv==1.0.1
+
+# Optional: System audio playback (install via apt/brew)
+# Linux: sudo apt install mpg123
+# macOS: brew install mpg123
