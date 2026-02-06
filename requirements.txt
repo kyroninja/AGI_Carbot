@@ -16,6 +16,8 @@ numpy==1.26.4
 # OBD-II Interface (uncomment when ready to use)
 # obd==0.7.1
 # pyserial==3.5
+py-obdii==0.9.1b0
+ELM327-emulator==3.0.5
 
 # Networking & Geolocation
 requests==2.31.0
