@@ -8,6 +8,8 @@ output/
 *.wav
 *.mp3
 *.log
+*.jpg
+*.jsonl
 
 # Python
 __pycache__/

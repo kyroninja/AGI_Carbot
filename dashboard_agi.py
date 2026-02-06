@@ -19,6 +19,9 @@ import threading
 from queue import Queue, Empty
 from enum import Enum
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+
 import sounddevice as sd
 from scipy.io.wavfile import write
 import speech_recognition as sr
@@ -29,6 +32,11 @@ from geopy.geocoders import Nominatim
 from ultralytics import YOLO
 import cv2
 import numpy as np
+
+# OBD2 imports
+import obdii
+
+load_dotenv()
 
 
 # ============================================================================
@@ -42,6 +50,23 @@ class VehicleState(Enum):
     PARKED = "parked"
     WARNING = "warning"
     CRITICAL = "critical"
+
+
+
+# ============================================================================
+# PyTorch 2.6+ Compatibility: Fix weights_only loading issue
+# ============================================================================
+try:
+    import torch
+    # Monkey-patch torch.load to use weights_only=False for compatibility
+    _original_torch_load = torch.load
+    def patched_torch_load(f, *args, **kwargs):
+        # Force weights_only=False for older model formats
+        kwargs.setdefault('weights_only', False)
+        return _original_torch_load(f, *args, **kwargs)
+    torch.load = patched_torch_load
+except Exception as e:
+    pass  # Patching failed, will attempt to load models anyway
 
 
 class AlertLevel(Enum):
@@ -107,8 +132,6 @@ class DashboardConfig:
         "Be concise, professional, and prioritize safety above all else. "
         "Speak naturally as if you're a knowledgeable co-pilot."
     )
-    
-    # YOLO Settings
     YOLO_MODEL: str = "yolov8n.pt"
     YOLO_CONFIDENCE: float = 0.5
     YOLO_IOU_THRESHOLD: float = 0.45
@@ -288,10 +311,18 @@ class OBDInterface:
             # import obd
             # self.connection = obd.OBD(portstr=self.config.OBD_PORT, baudrate=self.config.OBD_BAUDRATE)
             # self.is_connected = self.connection.is_connected()
+
+            # OBD2 implementation
+            conn = obdii.Connection(("127.0.0.1", 35000))
+
+            if conn.is_connected():
+                self.connection = conn
+                self.is_connected = True
+                self.logger.info("OBD-II connection established successfully")
             
             # Placeholder for development
-            self.is_connected = False
-            self.logger.warning("OBD-II interface not implemented - using simulated data")
+            #self.is_connected = False
+            #self.logger.warning("OBD-II interface not implemented - using simulated data")
             
         except Exception as e:
             self.logger.error(f"Failed to connect to OBD-II: {e}")
@@ -315,8 +346,20 @@ class OBDInterface:
             # data.vehicle_speed = self.connection.query(obd.commands.SPEED).value
             # data.engine_temp = self.connection.query(obd.commands.COOLANT_TEMP).value
             # ... etc
+
+            data = OBDData(timestamp=datetime.now())
+
+            try:
+                data.engine_rpm = self.connection.query(obdii.commands.ENGINE_SPEED).value
+                data.vehicle_speed = self.connection.query(obdii.commands.VEHICLE_SPEED).value
+                #data.engine_temp = self.connection.query(commands.ENGINE_COOLANT_TEMP).value
+                #data.throttle_position = self.connection.query(commands.THROTTLE_POSITION).value
+                #data.fuel_level = self.connection.query(commands.FUEL_LEVEL).value
+
+            except Exception as e:
+                self.logger.warning("Some OBD-II data points are missing")
             
-            return self._get_simulated_data()
+            return OBDData(timestamp=datetime.now())
             
         except Exception as e:
             self.logger.error(f"Error reading OBD data: {e}")
@@ -526,6 +569,7 @@ class DashcamVision:
         Returns:
             VisionAnalysis object with detected objects and conditions
         """
+
         try:
             # Run YOLO detection
             results = self.model(
@@ -884,30 +928,76 @@ class AudioHandler:
             return ""
     
     def speak_text(self, text: str, priority: bool = False) -> bool:
-        """Convert text to speech and play it."""
+        """Convert text to speech and play it with unique filename to avoid file lock issues.
+        
+        CHANGE: Fixed 'Permission denied' error by using unique filenames instead of overwriting
+        the same file. Windows Media Player was locking the file, preventing overwrites.
+        Solution: Generate unique filename with timestamp for each speech call.
+        """
         try:
             if not text:
                 return False
             
-            self.logger.info(f"Speaking: '{text[:50]}...'")
+            self.logger.info(f"Speaking: '{text[:50]}...'")  
             
-            # Generate speech
+            # CHANGE: Generate speech with unique filename using timestamp
+            # Format: assistant_20260206_123045_123456.mp3
+            # This ensures no file lock conflicts between consecutive speak_text calls
             speech = gTTS(text=text, lang='en', slow=False)
-            speech_path = self.config.OUTPUT_DIR / self.config.SPEECH_FILE
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:18]
+            unique_speech_file = f"assistant_{timestamp}.mp3"
+            speech_path = self.config.OUTPUT_DIR / unique_speech_file
             speech.save(str(speech_path))
             
-            # Play audio (platform-specific)
+            # CHANGE: Play audio (platform-specific)
+            # Each file has unique name, so Windows Media Player won't lock previous file
             if os.name == 'posix':  # Linux/Unix
                 os.system(f"mpg123 -q {speech_path} &")
             elif os.name == 'nt':  # Windows
                 os.system(f"start {speech_path}")
+            
+            # CHANGE: Periodically cleanup old speech files to prevent disk space issues
+            # Keep only the 10 most recent audio files
+            if timestamp.endswith('0'):  # Cleanup every ~10 calls to reduce overhead
+                self.cleanup_old_speech_files(keep_recent=10)
             
             return True
             
         except Exception as e:
             self.logger.error(f"Text-to-speech failed: {e}")
             return False
-
+    
+    def cleanup_old_speech_files(self, keep_recent: int = 10) -> None:
+        """Remove old speech files to prevent disk space accumulation.
+        
+        CHANGE: New method to manage cleanup of generated speech files.
+        Without cleanup, thousands of MP3 files would accumulate over time.
+        Keeps only the N most recent files based on modification time.
+        
+        Args:
+            keep_recent: Number of recent files to keep (default: 10)
+        """
+        try:
+            # Get the speech output directory
+            speech_dir = self.config.OUTPUT_DIR
+            
+            # CHANGE: Find all assistant_*.mp3 files sorted by modification time (newest first)
+            speech_files = sorted(
+                speech_dir.glob("assistant_*.mp3"),
+                key=lambda f: f.stat().st_mtime,
+                reverse=True  # Newest first
+            )
+            
+            # CHANGE: Delete files older than the keep_recent threshold
+            # This safely removes old MP3s without affecting current playback
+            for old_file in speech_files[keep_recent:]:
+                try:
+                    old_file.unlink()  # Delete the file
+                    self.logger.debug(f"Cleaned up old speech file: {old_file.name}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to delete {old_file.name}: {e}")
+        except Exception as e:
+            self.logger.warning(f"Cleanup of speech files failed: {e}")
 
 # ============================================================================
 # AGI Brain Module
@@ -935,7 +1025,10 @@ class AGIBrain:
             return
         
         try:
-            self.client = OpenAI(api_key=self.config.OPENAI_API_KEY)
+            import httpx
+            # Use a simple httpx client to avoid proxy compatibility issues
+            http_client = httpx.Client()
+            self.client = OpenAI(api_key=self.config.OPENAI_API_KEY, http_client=http_client)
             self.logger.info("OpenAI client initialized")
         except Exception as e:
             self.logger.error(f"Failed to initialize OpenAI client: {e}")
@@ -978,10 +1071,14 @@ class AGIBrain:
         # Navigation
         if navigation_info:
             context_parts.append("\n[Navigation]")
-            if 'current_location' in navigation_info:
+            # FIX: Check if current_location exists AND is not None before calling .get()
+            # Previous bug: checked if key existed but didn't validate the value was a dict
+            if navigation_info.get('current_location') is not None:
                 loc = navigation_info['current_location']
                 context_parts.append(f"Location: {loc.get('city', 'Unknown')}")
-            if 'route' in navigation_info:
+            # FIX: Check if route exists AND is not None before calling .get()
+            # This prevents 'NoneType' object has no attribute 'get' error
+            if navigation_info.get('route') is not None:
                 route = navigation_info['route']
                 context_parts.append(f"Route: {route.get('distance_km')} km, {route.get('duration_min')} min")
         
