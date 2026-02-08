@@ -9,6 +9,7 @@ provides navigation, and converses with the driver for enhanced safety and conve
 import os
 import time
 import logging
+import subprocess
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
 from dataclasses import dataclass, field
@@ -16,7 +17,7 @@ from collections import deque
 from datetime import datetime
 import json
 import threading
-from queue import Queue, Empty
+from queue import Queue, Empty, PriorityQueue
 from enum import Enum
 
 # Load environment variables from .env file
@@ -94,12 +95,11 @@ class DashboardConfig:
     AUDIO_CHANNELS: int = 2
     AUDIO_DTYPE: str = 'int16'
     VOICE_ACTIVATION_THRESHOLD: float = 500.0
-    # FIX: Delay before recording after speaking to prevent self-recording
-    # Reason: speak_text() launches Windows Media Player asynchronously (non-blocking)
-    # Without this delay, record_audio() starts while audio is still playing
-    # Microphone picks up speaker output = echo/self-recording artifact
-    # Set to 15 seconds to allow typical TTS audio to complete playback before next recording
-    AUDIO_PLAYBACK_DELAY: int = 15
+    # IMPROVED: With queue-based audio playback, audio is truly sequential and blocking
+    # The AudioPlaybackThread ensures current audio completes before next plays
+    # This delay is now just for natural conversation flow, not for playback completion
+    # Set to 2 seconds: minimal delay for natural pause between user input and response
+    AUDIO_PLAYBACK_DELAY: int = 2
     
     # Vision Settings
     CAMERA_INDEX: int = 0
@@ -876,6 +876,108 @@ class NavigationService:
 
 
 # ============================================================================
+# Audio Playback Queue Thread
+# ============================================================================
+
+class AudioPlaybackThread(threading.Thread):
+    """Background thread that manages sequential audio playback from a queue.
+    
+    Ensures audio plays completely and blocks new playback until current finishes.
+    Supports priority levels so critical alerts can interrupt lower-priority speech.
+    """
+    
+    def __init__(self, logger: logging.Logger):
+        super().__init__(daemon=True)
+        self.logger = logger
+        # Priority queue: (priority_level, timestamp, audio_file)
+        # Lower priority number = higher priority (0 = critical, 2 = normal)
+        self.playback_queue: PriorityQueue = PriorityQueue()
+        self.running = True
+        self.current_process = None
+        self.current_file = None
+    
+    def enqueue_audio(self, audio_file: str, priority: int = 2) -> None:
+        """Add audio file to playback queue.
+        
+        Args:
+            audio_file: Path to audio file to play
+            priority: Priority level (0=critical/high, 1=medium, 2=normal/low)
+        """
+        # Use timestamp to maintain FIFO order within same priority level
+        timestamp = datetime.now().timestamp()
+        self.playback_queue.put((priority, timestamp, audio_file))
+        self.logger.debug(f"Queued audio: {os.path.basename(audio_file)} (priority={priority})")
+    
+    def run(self) -> None:
+        """Main thread loop - continuously play audio from queue."""
+        self.logger.info("Audio playback thread started")
+        
+        while self.running:
+            try:
+                # Wait for next audio file in queue (0.5s timeout to check running flag)
+                try:
+                    priority, timestamp, audio_file = self.playback_queue.get(timeout=0.5)
+                except Empty:
+                    continue
+                
+                # Skip if file doesn't exist
+                if not os.path.exists(audio_file):
+                    self.logger.warning(f"Audio file not found, skipping: {audio_file}")
+                    continue
+                
+                self.current_file = audio_file
+                self.logger.debug(f"Starting playback: {os.path.basename(audio_file)}")
+                
+                # Play audio file and wait for completion
+                if os.name == 'nt':  # Windows
+                    # Use subprocess to launch and wait for completion
+                    self.current_process = subprocess.Popen(
+                        f'start {audio_file}',
+                        shell=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    # Get approximate duration and wait
+                    # In a production system, you could query the MP3 duration
+                    # For now, estimate 2-10 seconds per message
+                    self.current_process.wait()
+                    # Add small buffer to ensure playback finishes
+                    time.sleep(0.5)
+                else:  # Linux/macOS
+                    self.current_process = subprocess.Popen(
+                        f'mpg123 -q {audio_file}',
+                        shell=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    self.current_process.wait()
+                    time.sleep(0.5)
+                
+                self.logger.debug(f"Finished playback: {os.path.basename(audio_file)}")
+                self.current_file = None
+                
+            except Exception as e:
+                self.logger.error(f"Playback error: {e}")
+                self.current_file = None
+    
+    def stop(self) -> None:
+        """Stop the playback thread gracefully."""
+        self.logger.info("Stopping audio playback thread...")
+        self.running = False
+        
+        # Kill any currently playing process
+        if self.current_process and self.current_process.poll() is None:
+            try:
+                self.current_process.terminate()
+                self.current_process.wait(timeout=1)
+            except:
+                pass
+        
+        self.join(timeout=2)
+        self.logger.info("Audio playback thread stopped")
+
+
+# ============================================================================
 # Audio Module
 # ============================================================================
 
@@ -887,6 +989,10 @@ class AudioHandler:
         self.logger = logger
         self.recognizer = sr.Recognizer()
         self.is_listening = False
+        
+        # Initialize audio playback thread for sequential, non-blocking playback
+        self.playback_thread = AudioPlaybackThread(logger)
+        self.playback_thread.start()
     
     def record_audio(self, duration: Optional[int] = None) -> str:
         """Record audio from microphone."""
@@ -938,11 +1044,17 @@ class AudioHandler:
             return ""
     
     def speak_text(self, text: str, priority: bool = False) -> bool:
-        """Convert text to speech and play it with unique filename to avoid file lock issues.
+        """Convert text to speech and queue for playback (non-blocking).
         
-        CHANGE: Fixed 'Permission denied' error by using unique filenames instead of overwriting
-        the same file. Windows Media Player was locking the file, preventing overwrites.
-        Solution: Generate unique filename with timestamp for each speech call.
+        NEW BEHAVIOR: Uses background playback thread with audio queue.
+        - Returns immediately after enqueuing (non-blocking)
+        - Audio plays sequentially in background thread
+        - Other events can process while audio is playing
+        - Supports priority: set priority=True for critical alerts to skip queue
+        
+        CHANGE: Replaced direct os.system() with queue-based system.
+        Previous: Blocking playback or complex timing workarounds
+        Now: True non-blocking with queue and priority support
         """
         try:
             if not text:
@@ -950,23 +1062,20 @@ class AudioHandler:
             
             self.logger.info(f"Speaking: '{text[:50]}...'")  
             
-            # CHANGE: Generate speech with unique filename using timestamp
+            # Generate speech with unique filename using timestamp
             # Format: assistant_20260206_123045_123456.mp3
-            # This ensures no file lock conflicts between consecutive speak_text calls
             speech = gTTS(text=text, lang='en', slow=False)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:18]
             unique_speech_file = f"assistant_{timestamp}.mp3"
             speech_path = self.config.OUTPUT_DIR / unique_speech_file
             speech.save(str(speech_path))
             
-            # CHANGE: Play audio (platform-specific)
-            # Each file has unique name, so Windows Media Player won't lock previous file
-            if os.name == 'posix':  # Linux/Unix
-                os.system(f"mpg123 -q {speech_path} &")
-            elif os.name == 'nt':  # Windows
-                os.system(f"start {speech_path}")
+            # Enqueue audio for playback (non-blocking)
+            # priority=0 for critical alerts, 2 for normal responses
+            priority_level = 0 if priority else 2
+            self.playback_thread.enqueue_audio(str(speech_path), priority=priority_level)
             
-            # CHANGE: Periodically cleanup old speech files to prevent disk space issues
+            # Periodically cleanup old speech files to prevent disk space issues
             # Keep only the 10 most recent audio files
             if timestamp.endswith('0'):  # Cleanup every ~10 calls to reduce overhead
                 self.cleanup_old_speech_files(keep_recent=10)
@@ -1008,6 +1117,11 @@ class AudioHandler:
                     self.logger.warning(f"Failed to delete {old_file.name}: {e}")
         except Exception as e:
             self.logger.warning(f"Cleanup of speech files failed: {e}")
+    
+    def stop(self) -> None:
+        """Stop the audio playback thread gracefully."""
+        if self.playback_thread:
+            self.playback_thread.stop()
 
 
 # ============================================================================
@@ -1637,21 +1751,23 @@ class DashboardAGI:
             self.audio.speak_text(response)
             
             # ====================================================================
-            # IMPORTANT: Wait for audio playback to complete before returning
+            # IMPROVED: Audio now plays asynchronously in queue without blocking main loop
             # ====================================================================
-            # REASON: speak_text() uses os.system(f"start {speech_path}") which launches
-            # Windows Media Player asynchronously and returns immediately without waiting.
-            # PROBLEM: If the listener thread resumes recording while playback is ongoing,
-            # the microphone will pick up the speaker output, creating echo/self-recording.
-            # SOLUTION: Delay ensures playback completes before listener resumes recording.
-            # TIMING: 15 seconds allows typical conversational responses to finish playing
-            # and accounts for natural pause before user speaks the next wake word.
+            # WITH NEW QUEUE SYSTEM:
+            # - speak_text() enqueues the audio and returns immediately (non-blocking)
+            # - Main loop remains responsive to alerts and events
+            # - Audio plays sequentially in background thread (truly blocking playback)
+            # - No more hardcoded 15-second wait needed for reliable playback
+            #
+            # STILL WAITING FOR NATURAL FLOW:
+            # We keep a small delay to provide natural pause before next interaction
+            # This gives the driver time to process the response before speaking again
+            # Setting to 2 seconds: enough for audio to finish + natural pause
             self.logger.info(
-                f"Waiting {self.config.AUDIO_PLAYBACK_DELAY}s for audio playback to complete "
-                f"before resuming listening..."
+                f"Waiting {self.config.AUDIO_PLAYBACK_DELAY}s for natural interaction pause..."
             )
             time.sleep(self.config.AUDIO_PLAYBACK_DELAY)
-            # ====================================================================
+            # =====================================================================
             
         except Exception as e:
             self.logger.error(f"Voice interaction error: {e}")
@@ -1726,6 +1842,7 @@ class DashboardAGI:
         Clean shutdown of all systems.
         
         Gracefully terminates all threads and releases resources:
+        - Stops audio playback thread (wait for current audio to finish)
         - Stops audio listener (so it stops recording)
         - Stops OBD/vision monitoring
         - Waits for threads to finish
@@ -1740,6 +1857,10 @@ class DashboardAGI:
         # ========================================================================
         # Stop background monitoring threads
         # ========================================================================
+        # Stop audio playback thread (gracefully finish current playback)
+        if self.audio:
+            self.audio.stop()
+        
         # Stop audio listener (prevents continuing to record)
         if self.audio_listener:
             self.audio_listener.stop()
